@@ -1,0 +1,845 @@
+Colab is now part of Google AI Plans. Get upgraded compute power and a suite of new AI tools all in one bundle.
+Untitled0.ipynb
+Untitled0.ipynb_
+Files
+..
+Drop files to upload them to session storage.
+Disk
+106.37 GB available
+
+[ ]
+
+Start coding or generate with AI.
+Double-click (or enter) to edit
+
+
+[5]
+32s
+# ==============================================================================
+# GCI WORLD 2026 WINTER — END-TO-END COLAB PIPELINE (COMPANY A TELECOM)
+# ==============================================================================
+import os
+from pathlib import Path
+
+from google.colab import drive
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
+
+pd.set_option('display.max_columns', 120)
+sns.set_theme(style='whitegrid', context='talk')
+
+# ------------------------------------------------------------------------------
+# 1. Mount Drive & Auto-Locate telecom/Client.csv and telecom/Record.csv
+# ------------------------------------------------------------------------------
+try:
+    drive.mount('/content/drive', force_remount=False)
+except Exception as e:
+    print("Drive mount skipped or already mounted.")
+
+search_roots = [
+    Path('/content/telecom'),
+    Path('/content/drive/MyDrive'),
+    Path('/content/drive'),
+    Path('/content'),
+]
+
+work_dir = None
+client_path = None
+record_path = None
+
+for root in search_roots:
+  if not root.exists():
+    continue
+  if root.name == 'telecom' and (root / 'Client.csv').exists() and (root / 'Record.csv').exists():
+    client_path = root / 'Client.csv'
+    record_path = root / 'Record.csv'
+    work_dir = root.parent
+    break
+  for c_file in root.rglob('Client.csv'):
+    r_file = c_file.parent / 'Record.csv'
+    if r_file.exists():
+      client_path = c_file
+      record_path = r_file
+      work_dir = c_file.parent.parent
+      break
+  if client_path:
+    break
+
+if not client_path or not record_path:
+  raise FileNotFoundError(
+      'Could not find Client.csv and Record.csv inside a telecom/ folder. '
+      'Check your Google Drive path or upload telecom/Client.csv and'
+      ' telecom/Record.csv.'
+  )
+
+os.chdir(work_dir)
+print(f'Working directory set to: {os.getcwd()}')
+print(f'Found Client.csv: {client_path}')
+print(f'Found Record.csv: {record_path}')
+
+# ------------------------------------------------------------------------------
+# 2. Load & Merge Source Tables
+# ------------------------------------------------------------------------------
+client = pd.read_csv(client_path)
+record = pd.read_csv(record_path)
+
+# Make column types consistent and merge
+record['Customer_ID'] = record['Customer_ID'].astype(str)
+client['Customer_ID'] = client['Customer_ID'].astype(str)
+
+df = record.merge(client, on='Customer_ID', how='inner')
+print(f'\nMerged dataset shape: {df.shape}')
+print('Target (churn) distribution:')
+print(df['churn'].value_counts(dropna=False))
+
+# Ensure target is numeric
+df['churn'] = pd.to_numeric(df['churn'], errors='coerce')
+df = df.dropna(subset=['churn'])
+df['churn'] = df['churn'].astype(int)
+print(df['churn'].value_counts(normalize=True).round(4))
+
+# ------------------------------------------------------------------------------
+# 3. Exploratory Data Analysis Summaries
+# ------------------------------------------------------------------------------
+# Ensure relevant columns are numeric
+df['eqpdays'] = pd.to_numeric(df['eqpdays'], errors='coerce')
+df['change_mou'] = pd.to_numeric(df['change_mou'], errors='coerce')
+df['months'] = pd.to_numeric(df['months'], errors='coerce')
+df['mou_Mean'] = pd.to_numeric(df['mou_Mean'], errors='coerce')
+df['change_rev'] = pd.to_numeric(df['change_rev'], errors='coerce')
+df['rev_Mean'] = pd.to_numeric(df['rev_Mean'], errors='coerce')
+
+stayed_eqp = df.loc[df['churn'] == 0, 'eqpdays']
+churned_eqp = df.loc[df['churn'] == 1, 'eqpdays']
+
+print('\n--- EDA SUMMARY ---')
+print(f'Mean handset age (stayed):  {stayed_eqp.mean():.1f} days')
+print(f'Mean handset age (churned): {churned_eqp.mean():.1f} days')
+print(
+    'Median monthly minutes change (change_mou) — stayed:'
+    f" {df.loc[df['churn'] == 0, 'change_mou'].median():.1f}, churned:"
+    f" {df.loc[df['churn'] == 1, 'change_mou'].median():.1f}"
+)
+
+# ------------------------------------------------------------------------------
+# 4. Preprocessing & Actionable Feature Engineering
+# ------------------------------------------------------------------------------
+df_feat = df.drop(columns=['Customer_ID']).copy()
+
+# Drop columns with > 40% missing values (keep target 'churn' untouched)
+missing_pct = df_feat.drop(columns=['churn']).isna().mean()
+high_missing_cols = missing_pct[missing_pct > 0.40].index.tolist()
+df_feat = df_feat.drop(columns=high_missing_cols)
+print(
+    f'\nDropped {len(high_missing_cols)} columns with >40% missingness:'
+    f' {high_missing_cols}'
+)
+
+
+# Safe division helper to prevent division-by-zero or infinities
+def safe_div(num, den):
+  den_clean = den.replace(0, np.nan)
+  return (num / den_clean).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+# Actionable business & behavioral features
+if {'eqpdays', 'months'}.issubset(df_feat.columns):
+  df_feat['eqp_tenure_ratio'] = safe_div(
+      df_feat['eqpdays'], df_feat['months'] * 30.0
+  )
+
+if {'change_mou', 'mou_Mean'}.issubset(df_feat.columns):
+  df_feat['rel_mou_change'] = safe_div(df_feat['change_mou'], df_feat['mou_Mean'])
+
+if {'change_rev', 'rev_Mean'}.issubset(df_feat.columns):
+  df_feat['rel_rev_change'] = safe_div(df_feat['change_rev'], df_feat['rev_Mean'])
+
+if {'drop_vce_Mean', 'blck_vce_Mean', 'attempt_Mean'}.issubset(df_feat.columns):
+  df_feat['drop_vce_Mean'] = pd.to_numeric(df_feat['drop_vce_Mean'], errors='coerce')
+  df_feat['blck_vce_Mean'] = pd.to_numeric(df_feat['blck_vce_Mean'], errors='coerce')
+  df_feat['attempt_Mean'] = pd.to_numeric(df_feat['attempt_Mean'], errors='coerce')
+  df_feat['fail_call_rate'] = safe_div(
+      df_feat['drop_vce_Mean'].fillna(0) + df_feat['blck_vce_Mean'].fillna(0),
+      df_feat['attempt_Mean'],
+  )
+
+if {'ovrrev_Mean', 'rev_Mean'}.issubset(df_feat.columns):
+  df_feat['ovrrev_Mean'] = pd.to_numeric(df_feat['ovrrev_Mean'], errors='coerce')
+  df_feat['overage_rev_share'] = safe_div(
+      df_feat['ovrrev_Mean'], df_feat['rev_Mean']
+  )
+
+# Convert string/object columns to pandas 'category' so XGBoost handles NaNs & categories natively
+cat_cols = df_feat.select_dtypes(include=['object', 'string']).columns.tolist()
+for col in cat_cols:
+  df_feat[col] = df_feat[col].astype('category')
+
+print(f'Feature-engineered dataset shape: {df_feat.shape}')
+
+# ------------------------------------------------------------------------------
+# 5. Train / Test Split & XGBoost Classifier
+# ------------------------------------------------------------------------------
+X = df_feat.drop(columns=['churn'])
+y = df_feat['churn'].astype(int)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.25, random_state=42, stratify=y
+)
+
+model = XGBClassifier(
+    n_estimators=400,
+    learning_rate=0.03,
+    max_depth=5,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    enable_categorical=True,
+    eval_metric='logloss',
+    random_state=42,
+    n_jobs=-1,
+)
+
+model.fit(X_train, y_train)
+
+y_pred = model.predict(X_test)
+y_proba = model.predict_proba(X_test)[:, 1]
+
+print('\n--- MODEL EVALUATION (HELD-OUT TEST SET) ---')
+print(f'Accuracy:  {accuracy_score(y_test, y_pred):.4f}')
+print(f'ROC-AUC:   {roc_auc_score(y_test, y_proba):.4f}')
+print(f'Precision: {precision_score(y_test, y_pred):.4f}')
+print(f'Recall:    {recall_score(y_test, y_pred):.4f}')
+print(f'F1 Score:  {f1_score(y_test, y_pred):.4f}\n')
+print(
+    classification_report(y_test, y_pred, target_names=['Stayed (0)', 'Churned (1)'])
+)
+
+# Top 15 features by Gain
+importances = pd.Series(
+    model.feature_importances_, index=X.columns
+).sort_values(ascending=False)
+print('Top 15 Features by Importance:')
+print(importances.head(15).round(4))
+
+# ------------------------------------------------------------------------------
+# 6. Quantified Business Proposal & ROI Calculation
+# ------------------------------------------------------------------------------
+eval_df = pd.DataFrame(index=X_test.index)
+eval_df['actual_churn'] = y_test.values
+eval_df['churn_prob'] = y_proba
+eval_df['rev_Mean'] = X_test['rev_Mean'] if 'rev_Mean' in X_test.columns else 0.0
+eval_df['eqpdays'] = X_test['eqpdays'] if 'eqpdays' in X_test.columns else 0.0
+eval_df['change_mou'] = (
+    X_test['change_mou'] if 'change_mou' in X_test.columns else 0.0
+)
+eval_df['risk_percentile'] = eval_df['churn_prob'].rank(pct=True)
+
+# Target segment: Top 15% highest churn risk + monthly revenue >= $40 + handset age > 365 days
+target_mask = (
+    (eval_df['risk_percentile'] >= 0.85)
+    & (eval_df['rev_Mean'] >= 40.0)
+    & (eval_df['eqpdays'] > 365.0)
+)
+target_group = eval_df[target_mask]
+
+# Scale test set (25,000 rows) to full 100,000-customer base
+scale_factor = len(df) / len(X_test)
+
+# Transparent business assumptions (adjust to match your proposal)
+INTERVENTION_COST = (
+    35.0  # $35 handset upgrade voucher / bill credit per targeted user
+)
+SAVE_RATE = 0.25  # 25% of targeted true churners retained by offer
+RETENTION_HORIZON_MO = 12  # 12 months of retained service post-intervention
+GROSS_MARGIN = 0.65  # 65% telecom gross margin
+
+targeted_customers = len(target_group) * scale_factor
+true_churners_in_target = target_group['actual_churn'].sum() * scale_factor
+target_churn_rate = (
+    target_group['actual_churn'].mean() if len(target_group) > 0 else 0.0
+)
+avg_arpu_target = (
+    target_group['rev_Mean'].mean() if len(target_group) > 0 else 0.0
+)
+
+saved_customers = true_churners_in_target * SAVE_RATE
+retained_gross_profit = (
+    saved_customers * avg_arpu_target * RETENTION_HORIZON_MO * GROSS_MARGIN
+)
+campaign_cost = targeted_customers * INTERVENTION_COST
+net_financial_impact = retained_gross_profit - campaign_cost
+roi_pct = (
+    (net_financial_impact / campaign_cost) * 100 if campaign_cost > 0 else 0.0
+)
+
+print('\n--- QUANTIFIED BUSINESS PROPOSAL (SCALED TO 100K BASE) ---')
+print(
+    'Targeted Segment (Top 15% Risk + ARPU >= $40 + eqpdays > 365):'
+    f' {targeted_customers:,.0f} customers'
+)
+print(
+    'Actual Churn Rate in Target Segment:                          '
+    f' {target_churn_rate*100:.1f}% ({true_churners_in_target:,.0f} churners)'
+)
+print(
+    'Average Monthly Revenue (ARPU) in Target Segment:             '
+    f' ${avg_arpu_target:.2f}'
+)
+print(
+    'Estimated Customers Saved (25% save rate):                    '
+    f' {saved_customers:,.0f}'
+)
+print(
+    '12-Month Retained Gross Margin (65% margin):                  '
+    f' ${retained_gross_profit:,.0f}'
+)
+print(
+    'Total Campaign Cost ($35 voucher/customer):                   '
+    f' ${campaign_cost:,.0f}'
+)
+print(
+    'Net Financial Impact (Profit - Cost):                         '
+    f' ${net_financial_impact:,.0f}'
+)
+print(f'Campaign ROI:                                                 {roi_pct:.1f}%')
+
+# Sensitivity table across save rates (15%, 25%, 35%)
+print('\n--- SENSITIVITY ANALYSIS BY RETENTION SAVE RATE ---')
+for sr in [0.15, 0.25, 0.35]:
+  s_cust = true_churners_in_target * sr
+  s_gp = s_cust * avg_arpu_target * RETENTION_HORIZON_MO * GROSS_MARGIN
+  s_net = s_gp - campaign_cost
+  s_roi = (s_net / campaign_cost) * 100 if campaign_cost > 0 else 0.0
+  print(
+      f'Save Rate {sr*100:.0f}% -> Saved: {s_cust:,.0f} | Gross Margin:'
+      f' ${s_gp:,.0f} | Net Impact: ${s_net:,.0f} | ROI: {s_roi:.1f}%'
+  )
+
+# ------------------------------------------------------------------------------
+# 7. Presentation-Ready Charts (Saved as 300 DPI PNGs)
+# ------------------------------------------------------------------------------
+# Chart 1: Churn Rate by Handset Age Bucket
+eqp_bins = [-100, 180, 365, 540, 730, 10000]
+eqp_labels = ['0-6 mo', '6-12 mo', '12-18 mo', '18-24 mo', '24+ mo']
+df_plot = df[['eqpdays', 'churn', 'change_mou']].copy()
+df_plot['eqp_bucket'] = pd.cut(
+    df_plot['eqpdays'], bins=eqp_bins, labels=eqp_labels
+)
+churn_by_eqp = (
+    df_plot.groupby('eqp_bucket', observed=False)['churn'].mean() * 100
+)
+base_churn_pct = df_plot['churn'].mean() * 100
+
+fig, ax = plt.subplots(figsize=(9, 5))
+bars = sns.barplot(
+    x=churn_by_eqp.index, y=churn_by_eqp.values, hue=churn_by_eqp.index, palette='Blues_d', ax=ax, legend=False
+)
+ax.axhline(
+    base_churn_pct,
+    color='#dc2626',
+    linestyle='--',
+    linewidth=1.5,
+    label=f'Baseline Churn ({base_churn_pct:.1f}%)',
+)
+ax.set_title(
+    'Churn Risk Rises Across Aging Handset Buckets',
+    fontsize=14,
+    fontweight='bold',
+    pad=14,
+)
+ax.set_xlabel('Handset Age (eqpdays)')
+ax.set_ylabel('Churn Rate (%)')
+ax.set_ylim(0, max(churn_by_eqp.values.max(), base_churn_pct) * 1.25)
+for bar in bars.patches:
+  h = bar.get_height()
+  if not np.isnan(h):
+    ax.text(
+        bar.get_x() + bar.get_width() / 2,
+        h + 1.0,
+        f'{h:.1f}%',
+        ha='center',
+        va='bottom',
+        fontsize=10,
+        fontweight='bold',
+    )
+ax.legend()
+plt.tight_layout()
+plt.savefig('chart1_handset_churn.png', dpi=300)
+plt.show()
+
+# Chart 2: Top-Decile Churn Lift & Cumulative Capture
+lift_df = eval_df[['actual_churn', 'churn_prob']].copy()
+lift_df['risk_decile'] = (
+    pd.qcut(lift_df['churn_prob'], q=10, labels=False, duplicates='drop') + 1
+)
+lift_df['risk_rank'] = 11 - lift_df['risk_decile']
+baseline_test_churn = lift_df['actual_churn'].mean()
+
+decile_summary = (
+    lift_df.groupby('risk_rank', as_index=False)
+    .agg(
+        customers=('actual_churn', 'count'),
+        churners=('actual_churn', 'sum'),
+        churn_rate=('actual_churn', 'mean'),
+    )
+    .sort_values('risk_rank')
+)
+decile_summary['lift'] = decile_summary['churn_rate'] / baseline_test_churn
+decile_summary['cum_churn_captured_pct'] = (
+    decile_summary['churners'].cumsum() / lift_df['actual_churn'].sum()
+) * 100
+
+fig, ax1 = plt.subplots(figsize=(9, 5))
+decile_labels = [f'D{i}' for i in decile_summary['risk_rank']]
+bar_colors = [
+    '#1a365d' if i <= 2 else '#64748b' for i in decile_summary['risk_rank']
+]
+
+bars = ax1.bar(
+    decile_labels, decile_summary['lift'], color=bar_colors, width=0.6
+)
+ax1.axhline(
+    1.0,
+    color='#dc2626',
+    linestyle='--',
+    linewidth=1.5,
+    label='Random Baseline (1.0x)',
+)
+ax1.set_title(
+    'Top Risk Deciles Concentrate Churners Above Random Baseline',
+    fontsize=14,
+    fontweight='bold',
+    pad=20,
+)
+ax1.set_xlabel('Risk Decile (D1 = Top 10% Highest Predicted Churn Risk)')
+ax1.set_ylabel('Lift Multiple', color='#1a365d')
+ax1.set_ylim(0, max(decile_summary['lift'].max(), 1.0) * 1.25)
+ax1.tick_params(axis='y', labelcolor='#1a365d')
+
+for bar, lift_val in zip(bars, decile_summary['lift']):
+  ax1.text(
+      bar.get_x() + bar.get_width() / 2,
+      bar.get_height() + 0.02,
+      f'{lift_val:.2f}x',
+      ha='center',
+      va='bottom',
+      fontsize=9.5,
+      fontweight='bold',
+      color='#0f172a',
+  )
+
+ax2 = ax1.twinx()
+ax2.plot(
+    decile_labels,
+    decile_summary['cum_churn_captured_pct'],
+    color='#0d9488',
+    marker='o',
+    linewidth=2.5,
+    label='Cumulative Churners Captured (%)',
+)
+ax2.set_ylabel('Cumulative Churners Captured (%)', color='#0d9488')
+ax2.set_ylim(0, 110)
+ax2.tick_params(axis='y', labelcolor='#0d9488')
+ax2.grid(False)
+
+lines1, labels1 = ax1.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax1.legend(
+    lines1 + lines2, labels1 + labels2, loc='upper right', frameon=True, fontsize=9.5
+)
+plt.tight_layout()
+plt.savefig('chart2_top_decile_churn_lift.png', dpi=300)
+plt.show()
+
+# Chart 3: Churn Rate by Recent Minutes Change (change_mou) Bucket
+mou_bins = [-10000, -100, -25, 25, 100, 10000]
+mou_labels = [
+    'Sharp Drop\n(<-100m)',
+    'Moderate Drop\n(-100 to -25m)',
+    'Stable\n(-25 to +25m)',
+    'Moderate Rise\n(+25 to +100m)',
+    'Sharp Rise\n(>+100m)',
+]
+df_plot['mou_bucket'] = pd.cut(
+    df_plot['change_mou'], bins=mou_bins, labels=mou_labels
+)
+churn_by_mou = (
+    df_plot.groupby('mou_bucket', observed=False)['churn'].mean() * 100
+)
+
+fig, ax = plt.subplots(figsize=(9.5, 5))
+bars = sns.barplot(
+    x=churn_by_mou.index, y=churn_by_mou.values, hue=churn_by_mou.index, palette='crest', ax=ax, legend=False
+)
+ax.axhline(
+    base_churn_pct,
+    color='#dc2626',
+    linestyle='--',
+    linewidth=1.5,
+    label=f'Baseline Churn ({base_churn_pct:.1f}%)',
+)
+ax.set_title(
+    'Churn Rate Across Recent Monthly Minutes Change (change_mou)',
+    fontsize=14,
+    fontweight='bold',
+    pad=14,
+)
+ax.set_xlabel('Change in Monthly Minutes of Use')
+ax.set_ylabel('Churn Rate (%)')
+ax.set_ylim(0, max(churn_by_mou.values.max(), base_churn_pct) * 1.25)
+for bar in bars.patches:
+  h = bar.get_height()
+  if not np.isnan(h):
+    ax.text(
+        bar.get_x() + bar.get_width() / 2,
+        h + 1.0,
+        f'{h:.1f}%',
+        ha='center',
+        va='bottom',
+        fontsize=10,
+        fontweight='bold',
+    )
+ax.legend()
+plt.tight_layout()
+plt.savefig('chart3_usage_drop_churn.png', dpi=300)
+plt.show()
+
+print('\nSaved charts to:', os.getcwd())
+print(' - chart1_handset_churn.png')
+print(' - chart2_top_decile_churn_lift.png')
+print(' - chart3_usage_drop_churn.png')
+
+
+[ ]
+import os
+from pathlib import Path
+from google.colab import drive
+
+print("--- 1. Mounting Google Drive ---")
+try:
+    drive.mount('/content/drive', force_remount=True)
+    print("✅ Google Drive successfully mounted!")
+except Exception as e:
+    print(f"❌ Failed to mount Google Drive: {e}")
+    print("Make sure you clicked 'Connect to Google Drive' and authorized permissions.")
+
+print("\n--- 2. Checking Drive Contents ---")
+mount_path = Path('/content/drive/MyDrive')
+if mount_path.exists():
+    print("Found Google Drive Root: /content/drive/MyDrive")
+    print("\nHere are the top-level folders in your Drive:")
+    try:
+        for item in mount_path.iterdir():
+            if item.is_dir() and not item.name.startswith('.'):
+                print(f" 📁 {item.name}")
+    except Exception as e:
+        print(f"Error listing directory: {e}")
+else:
+    print("❌ '/content/drive/MyDrive' does not exist. Check mount permissions.")
+
+print("\n--- 3. Searching for your assignment CSVs ---")
+found_any = False
+if mount_path.exists():
+    for filepath in mount_path.rglob('*.csv'):
+        if 'client' in filepath.name.lower() or 'record' in filepath.name.lower():
+            print(f"📍 Found file: {filepath}")
+            found_any = True
+
+if not found_any:
+    print("❌ No CSV files matching 'Client' or 'Record' were found in your Google Drive.")
+    print("Ensure you have uploaded the 'telecom' folder with 'Client.csv' and 'Record.csv' directly to your Google Drive.")
+
+[6]
+0s
+from google.colab import files
+
+# List of chart files to download
+charts = [
+    '/content/chart1_handset_churn.png',
+    '/content/chart2_top_decile_churn_lift.png',
+    '/content/chart3_usage_drop_churn.png'
+]
+
+print("Initiating downloads for the 3 generated presentation charts...")
+for chart in charts:
+    try:
+        files.download(chart)
+        print(f"✅ Downloading {chart.split('/')[-1]}")
+    except Exception as e:
+        print(f"❌ Failed to download {chart}: {e}")
+
+Sensitivity Analysis: Retention Incentive Cost vs. Campaign ROI
+This analysis evaluates the financial outcomes of varying the incentive/voucher value per targeted customer (from 25to50) while holding the base save rate constant at 25%.
+
+
+[7]
+1s
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Scenario values based on the previously computed variables
+targeted_cust = targeted_customers  # 3,864 customers scaled
+true_churners = true_churners_in_target
+avg_arpu = avg_arpu_target
+horizon_mo = RETENTION_HORIZON_MO
+margin = GROSS_MARGIN
+save_rate = SAVE_RATE # 25%
+
+saved_cust = true_churners * save_rate
+retained_gm = saved_cust * avg_arpu * horizon_mo * margin
+
+# Test various incentive values
+incentive_options = [20, 25, 30, 35, 40, 45, 50, 60]
+sensitivity_results = []
+
+for incentive in incentive_options:
+    total_cost = targeted_cust * incentive
+    net_impact = retained_gm - total_cost
+    roi_pct = (net_impact / total_cost) * 100 if total_cost > 0 else 0.0
+    
+    sensitivity_results.append({
+        'Incentive Cost ($)': incentive,
+        'Total Campaign Cost': total_cost,
+        'Net Financial Impact': net_impact,
+        'ROI (%)': roi_pct
+    })
+
+sens_df = pd.DataFrame(sensitivity_results)
+
+print("--- SENSITIVITY ANALYSIS BY INCENTIVE COST (SAVE RATE = 25%) ---")
+display(sens_df.style.format({
+    'Incentive Cost ($)': '${:,.0f}',
+    'Total Campaign Cost': '${:,.0f}',
+    'Net Financial Impact': '${:,.0f}',
+    'ROI (%)': '{:.1f}%'
+}))
+
+# Visualizing the incentive cost vs ROI trade-off
+fig, ax1 = plt.subplots(figsize=(10, 5))
+sns.lineplot(data=sens_df, x='Incentive Cost ($)', y='Net Financial Impact', marker='o', color='#0d9488', ax=ax1, linewidth=2.5)
+ax1.set_ylabel('Net Financial Impact ($)', color='#0d9488')
+ax1.tick_params(axis='y', labelcolor='#0d9488')
+ax1.set_xlabel('Incentive Cost per Targeted Customer ($)')
+ax1.set_title('Financial Impact & ROI Sensitivity to Incentive Costs', fontsize=14, fontweight='bold', pad=15)
+
+ax2 = ax1.twinx()
+sns.lineplot(data=sens_df, x='Incentive Cost ($)', y='ROI (%)', marker='s', color='#dc2626', ax=ax2, linewidth=2.5, linestyle='--')
+ax2.set_ylabel('Campaign ROI (%)', color='#dc2626')
+ax2.tick_params(axis='y', labelcolor='#dc2626')
+ax2.grid(False)
+
+plt.tight_layout()
+plt.savefig('incentive_sensitivity_chart.png', dpi=300)
+plt.show()
+
+📄 Export Notebook to Presentation PDF for Final Submission
+This cell installs the system requirements (texlive, pandoc) and compiles this live notebook into a clean PDF document, then triggers an automatic browser download.
+
+
+[8]
+4m
+# 1. Install PDF generation dependencies (pandoc and a lightweight LaTeX distribution)
+!apt-get update -qq && apt-get install -y -qq texlive-xetex texlive-fonts-recommended texlive-plain-generic pandoc > /dev/null
+
+# 2. Get the active notebook name in Colab dynamically and compile to PDF
+import ipywidgets as widgets
+from google.colab import files
+import glob
+
+# Locate the .ipynb files in the active runtime
+notebooks = glob.glob('*.ipynb')
+if not notebooks:
+    # If it's stored in the default Colab path, copy it first
+    !cp /content/drive/MyDrive/Colab\ Notebooks/*.ipynb . 2>/dev/null || true
+    notebooks = glob.glob('*.ipynb')
+
+if notebooks:
+    # Select the first notebook found
+    notebook_path = notebooks[0]
+    print(f"Compiling notebook: {notebook_path} to PDF...")
+    
+    # Run nbconvert to generate PDF
+    !jupyter nbconvert --to pdf "{notebook_path}"
+    
+    pdf_path = notebook_path.replace('.ipynb', '.pdf')
+    print(f"✅ PDF successfully compiled: {pdf_path}")
+    
+    # Trigger download
+    files.download(pdf_path)
+else:
+    print("❌ Active notebook file (.ipynb) not detected in this directory.")
+    print("Alternative: Click 'File' -> 'Print' -> 'Save as PDF' from your browser's print dialog to download a perfectly formatted PDF instantly!")
+
+
+[1]
+31s
+import os
+from pathlib import Path
+from google.colab import drive
+import pandas as pd
+
+# 1. Mount Google Drive
+try:
+    drive.mount('/content/drive', force_remount=False)
+    print("✅ Google Drive mounted successfully.")
+except Exception as e:
+    print(f"❌ Mounting failed: {e}")
+
+# 2. Search for Client.csv and Record.csv dynamically
+search_roots = [
+    Path('/content/drive/MyDrive'),
+    Path('/content/drive'),
+    Path('/content')
+]
+
+client_path = None
+record_path = None
+work_dir = None
+
+for root in search_roots:
+    if not root.exists():
+        continue
+    for c_file in root.rglob('Client.csv'):
+        r_file = c_file.parent / 'Record.csv'
+        if r_file.exists():
+            client_path = c_file
+            record_path = r_file
+            work_dir = c_file.parent.parent
+            break
+    if client_path:
+        break
+
+# 3. Load files if found
+if client_path and record_path:
+    os.chdir(work_dir)
+    print(f"📁 Working directory set to: {os.getcwd()}")
+    print(f"📍 Found Client.csv at: {client_path}")
+    print(f"📍 Found Record.csv at: {record_path}")
+    
+    client_df = pd.read_csv(client_path)
+    record_df = pd.read_csv(record_path)
+    print(f"\n✅ Successfully loaded Client.csv ({client_df.shape}) and Record.csv ({record_df.shape})!")
+    
+    # Display first few rows of each
+    print("\n--- Client Data Preview ---")
+    display(client_df.head())
+    print("\n--- Record Data Preview ---")
+    display(record_df.head())
+else:
+    print("❌ Could not find Client.csv and Record.csv in your Drive.")
+    print("Please verify that you have a folder named 'telecom' containing both files uploaded to your Google Drive.")
+Mounted at /content/drive
+✅ Google Drive mounted successfully.
+❌ Could not find Client.csv and Record.csv in your Drive.
+Please verify that you have a folder named 'telecom' containing both files uploaded to your Google Drive.
+
+[2]
+0s
+import os
+from pathlib import Path
+
+drive_root = Path('/content/drive/MyDrive')
+
+if not drive_root.exists():
+    print("❌ Google Drive is not mounted or not accessible at /content/drive/MyDrive.")
+else:
+    print("--- 📂 Google Drive Folder Structure & CSV Files --- ")
+    
+    # Walk through the directories and files
+    found_files = []
+    for root, dirs, files in os.walk(drive_root):
+        # Skip hidden directories like .shortcut-targets-by-id
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        
+        # Let's see if there are any CSV files in this directory
+        csv_files = [f for f in files if f.endswith('.csv') or f.endswith('.xlsx')]
+        if csv_files:
+            rel_path = os.path.relpath(root, drive_root)
+            print(f"\n📁 In Directory: MyDrive/{rel_path if rel_path != '.' else ''}")
+            for csv in csv_files:
+                full_path = os.path.join(root, csv)
+                print(f"  📄 {csv} (Full path: {full_path})")
+                found_files.append(full_path)
+                
+    if not found_files:
+        print("\n❌ No CSV or Excel files were found anywhere in your Drive.")
+        print("Please make sure you uploaded the files to the correct Google Drive account.")
+--- 📂 Google Drive Folder Structure & CSV Files --- 
+
+📁 In Directory: MyDrive/
+  📄 HCIA DATACOM MOCK -1-1.xlsx (Full path: /content/drive/MyDrive/HCIA DATACOM MOCK -1-1.xlsx)
+  📄 HomeCredit_columns_description.xlsx (Full path: /content/drive/MyDrive/HomeCredit_columns_description.xlsx)
+
+📁 In Directory: MyDrive/OO_GCI/Competition/input
+  📄 train.csv (Full path: /content/drive/MyDrive/OO_GCI/Competition/input/train.csv)
+  📄 test.csv (Full path: /content/drive/MyDrive/OO_GCI/Competition/input/test.csv)
+
+📁 In Directory: MyDrive/OO_GCI/Competition/output
+  📄 submission.csv (Full path: /content/drive/MyDrive/OO_GCI/Competition/output/submission.csv)
+
+[3]
+1m
+import os
+from pathlib import Path
+import pandas as pd
+from google.colab import auth
+import gspread
+from google.auth import default
+
+# 1. Authenticate to access Google Sheets API
+print("Authenticating with Google Drive...")
+auth.authenticate_user()
+creds, _ = default()
+gc = gspread.authorize(creds)
+
+# Define paths and IDs
+print("Opening Google Sheets files from Drive...")
+try:
+    # Open by name in your Drive
+    client_sheet = gc.open('Client')
+    record_sheet = gc.open('Record')
+    
+    # Get the first sheet tab
+    client_data = client_sheet.get_worksheet(0).get_all_values()
+    record_data = record_sheet.get_worksheet(0).get_all_values()
+    
+    # Convert to DataFrames
+    client_df = pd.DataFrame(client_data[1:], columns=client_data[0])
+    record_df = pd.DataFrame(record_data[1:], columns=record_data[0])
+    
+    # Save locally as true CSVs so your existing script works without any changes
+    os.makedirs('/content/telecom', exist_ok=True)
+    client_df.to_csv('/content/telecom/Client.csv', index=False)
+    record_df.to_csv('/content/telecom/Record.csv', index=False)
+    
+    print("\n✅ Successfully pulled Google Sheets and saved them as true CSVs!")
+    print(f"Client.csv: {client_df.shape}")
+    print(f"Record.csv: {record_df.shape}")
+    
+    # Display head
+    display(client_df.head(2))
+    
+except Exception as e:
+    print(f"❌ Failed to load directly via Sheets API: {e}")
+    print("\nAlternative step:")
+    print("1. Open your Google Drive in a browser tab.")
+    print("2. Right-click 'Client' and 'Record' -> Download -> Save as CSV.")
+    print("3. Upload the resulting Client.csv and Record.csv directly to the telecom/ folder in your Google Drive.")
+
+Colab paid products
+-
+Cancel contracts here
